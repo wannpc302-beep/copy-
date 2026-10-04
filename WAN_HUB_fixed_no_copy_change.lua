@@ -43,6 +43,9 @@ local copyPreviewFolder = nil
 local copyPreviewEnabled = false
 local copyPreviewToggle = nil
 local knownBlocks = {}
+local resetRequested = false
+local copyJobResetRequested = false
+local copyStatusUiEnabled = true
 
 
 local function canStartTask()
@@ -303,97 +306,44 @@ local function getPlayerZone(playerInstance)
 end
 
 local function setTransparency(transparencyWanted, block)
-    if not block or not block:FindFirstChild("PPart") then return end
-    if block.PPart.Transparency == transparencyWanted then return end
-
-    local tool = equipTool("PropertiesTool")
-    if not tool or not tool:FindFirstChild("SetPropertieRF") then return end
-
-    local calls = math.max(1, math.floor(transparencyWanted / 0.25))
-    local args = {"Transparency", {block}}
-
-    task.spawn(function()
-        for _ = 1, calls do
-            local ok, err = pcall(function()
-                tool.SetPropertieRF:InvokeServer(table.unpack(args))
-            end)
-            if not ok then
-                warn("[BABFT] Transparency failed: " .. tostring(err))
-                break
-            end
-            task.wait(0.03)
-        end
-    end)
-end
-
--- Anchored/Gravity:
--- ถ้าบล็อกเชื่อมกับบล็อกอื่นแล้ว ให้ใช้ไขควงตั้ง Anchored ได้ตั้งแต่ช่วงต้น
--- ถ้าบล็อกยังลอยเดี่ยว/ยังไม่เชื่อม จะเลื่อนไปตั้ง Anchored ในขั้นตอนสุดท้าย
--- เพื่อไม่ให้บล็อกลอยถูกล็อกเร็วเกินไป
-local function setAnchored(block)
-    if not block then return false end
+    if not block or not block:FindFirstChild("PPart") then return false end
+    transparencyWanted = math.clamp(tonumber(transparencyWanted) or 0, 0, 1)
+    if math.abs(block.PPart.Transparency - transparencyWanted) <= 0.02 then return true end
 
     local tool = equipTool("PropertiesTool")
     if not tool or not tool:FindFirstChild("SetPropertieRF") then return false end
+
+    -- PropertiesTool ปรับ Transparency เป็นขั้น ๆ; ทำแบบ synchronous
+    -- เพื่อไม่ให้ Copy วิ่งไปบล็อกถัดไปก่อนคำสั่งเดิมจบ
+    local calls = math.max(1, math.ceil(transparencyWanted / 0.25))
+    local args = {"Transparency", {block}}
+
+    for _ = 1, calls do
+        local ok, err = pcall(function()
+            tool.SetPropertieRF:InvokeServer(unpack(args))
+        end)
+        if not ok then
+            warn("[BABFT] Transparency failed: " .. tostring(err))
+            return false
+        end
+        task.wait(0.05)
+    end
+
+    return true
+end
+
+local function setAnchored(block)
+    if not block then return end
+
+    local tool = equipTool("PropertiesTool")
+    if not tool or not tool:FindFirstChild("SetPropertieRF") then return end
 
     local ok, err = pcall(function()
         tool.SetPropertieRF:InvokeServer("Anchored", {block})
     end)
     if not ok then
         warn("[BABFT] Anchored failed: " .. tostring(err))
-        return false
     end
-
-    return true
-end
-
--- ตรวจว่าบล็อกนี้ต่อกับ "บล็อกอื่น" ในโฟลเดอร์ปลายทางแล้วหรือยัง
--- ถ้าต่อแล้ว สามารถใช้แรงโน้มถ่วง/Anchored ได้ตั้งแต่ช่วงต้น
--- ถ้ายังลอยเดี่ยว จะถูกเลื่อนไปทำใน final pass เท่านั้น
-local function isConnectedToOtherBlock(block, destinationFolder)
-    if not block or not destinationFolder then return false end
-
-    local ppart = block:FindFirstChild("PPart")
-    if not ppart or not ppart:IsA("BasePart") then return false end
-
-    -- 1) ตรวจ joint/weld/snap ที่มีอยู่แล้ว
-    local okJoint, connectedParts = pcall(function()
-        return ppart:GetConnectedParts(true)
-    end)
-    if okJoint and type(connectedParts) == "table" then
-        for _, part in ipairs(connectedParts) do
-            if part ~= ppart and part:IsA("BasePart") then
-                local otherModel = part:FindFirstAncestorOfClass("Model")
-                if otherModel and otherModel ~= block and otherModel.Parent == destinationFolder then
-                    return true
-                end
-            end
-        end
-    end
-
-    -- 2) ตรวจการสัมผัส/ชิดกันของ PPart โดยไม่พึ่ง CanCollide
-    -- ขยายกล่องเล็กน้อยเพื่อจับกรณีที่หน้าบล็อกชนกันพอดี
-    local overlapParams = OverlapParams.new()
-    overlapParams.FilterType = Enum.RaycastFilterType.Include
-    overlapParams.FilterDescendantsInstances = {destinationFolder}
-    overlapParams.MaxParts = 100
-
-    local size = ppart.Size + Vector3.new(0.08, 0.08, 0.08)
-    local okOverlap, parts = pcall(function()
-        return workspace:GetPartBoundsInBox(ppart.CFrame, size, overlapParams)
-    end)
-    if okOverlap and type(parts) == "table" then
-        for _, part in ipairs(parts) do
-            if part ~= ppart and part:IsA("BasePart") then
-                local otherModel = part:FindFirstAncestorOfClass("Model")
-                if otherModel and otherModel ~= block and otherModel.Parent == destinationFolder then
-                    return true
-                end
-            end
-        end
-    end
-
-    return false
 end
 
 local function rescaleBlock(block, newPos, newSize)
@@ -412,29 +362,37 @@ end
 
 local function placeBlock(name, pos, relativeTo, anchored)
     local tool = equipTool("BuildingTool")
-    if not tool or not tool:FindFirstChild("RF") then return end
+    if not tool or not tool:FindFirstChild("RF") then return false end
+    if typeof(pos) ~= "CFrame" then return false end
 
     if not relativeTo then
         relativeTo = getPlayerZone(player)
     end
 
     local relativeCFrame = getZoneCFrame(relativeTo)
+    if not relativeTo or not relativeCFrame then
+        warn("[BABFT] Place failed: destination base CFrame not found")
+        return false
+    end
+
     local args = {
         name,
         getBlockID(name),
         relativeTo,
-        relativeCFrame and relativeCFrame:ToObjectSpace(pos) or CFrame.new(),
+        relativeCFrame:ToObjectSpace(pos),
         anchored == true,
         pos,
         false,
     }
 
     local ok, err = pcall(function()
-        tool.RF:InvokeServer(table.unpack(args))
+        tool.RF:InvokeServer(unpack(args))
     end)
     if not ok then
         warn("[BABFT] Place failed: " .. tostring(err))
+        return false
     end
+    return true
 end
 
 local function paintBlock(block, color)
@@ -473,18 +431,14 @@ local function getNewBlockPos(hisBase, block, myBase)
         return CFrame.new()
     end
 
-    if not hisBase or not myBase then
+    local sourceCF = getZoneCFrame(hisBase)
+    local destinationCF = getZoneCFrame(myBase)
+    if not sourceCF or not destinationCF then
         return block.PPart.CFrame
     end
 
-    local hisBaseCFrame = getZoneCFrame(hisBase)
-    local myBaseCFrame = getZoneCFrame(myBase)
-    if not hisBaseCFrame or not myBaseCFrame then
-        return block.PPart.CFrame
-    end
-
-    local offset = hisBaseCFrame:ToObjectSpace(block.PPart.CFrame)
-    return myBaseCFrame * offset
+    local offset = sourceCF:ToObjectSpace(block.PPart.CFrame)
+    return destinationCF * offset
 end
 
 local function copyBuild(blocks)
@@ -498,25 +452,29 @@ local function copyBuild(blocks)
         return t
     end
 
-    -- เก็บทุกบล็อกที่มี PPart จริง ๆ
-    -- ห้ามใช้ค่าจาก Data/Blocks เป็นจำนวนบล็อก เพราะค่านั้นคือ ID ของบล็อก
+    usedList = {}
+
     for _, block in ipairs(blocks:GetChildren()) do
-        local ppart = block:FindFirstChild("PPart")
-        if ppart and ppart:IsA("BasePart") then
-            table.insert(t, {
-                Source = block,
-                Name = block.Name,
-                Pos = getNewBlockPos(hisBase, block, myBase),
-                Relative = myBase,
-                Transparency = ppart.Transparency,
-                Anchored = ppart.Anchored,
-                Size = ppart.Size,
-                Color = ppart.Color,
-            })
+        if block:FindFirstChild("PPart") then
+            local blockID = getBlockID(block.Name)
+
+            if blockID ~= 0 and (usedList[block.Name] or 0) < blockID then
+                usedList[block.Name] = (usedList[block.Name] or 0) + 1
+
+                table.insert(t, {
+                    Name = block.Name,
+                    Pos = getNewBlockPos(hisBase, block, myBase),
+                    Relative = myBase,
+                    Transparency = block.PPart.Transparency,
+                    Anchored = block.PPart.Anchored,
+                    Size = block.PPart.Size,
+                    Color = block.PPart.Color,
+                    Source = block,
+                })
+            end
         end
     end
 
-    -- รักษาลำดับบล็อกตามโฟลเดอร์ต้นทาง เพื่อไม่เปลี่ยนลำดับการสร้างของต้นฉบับ
     return t
 end
 
@@ -539,12 +497,12 @@ local function getMissingBlocks(expectedList, createdList)
     return missing
 end
 
-local function getBlock(expected, createdList, usedInstances)
+local function getBlock(expected, createdList)
     local best = nil
     local bestDist = math.huge
 
     for _, b in ipairs(createdList) do
-        if b and not (usedInstances and usedInstances[b]) and b:IsA("Model") and b.Name == expected.Name then
+        if b and b:IsA("Model") and b.Name == expected.Name then
             local ppart = b:FindFirstChild("PPart")
             if ppart and ppart:IsA("BasePart") then
                 local dist = (ppart.Position - expected.Pos.Position).Magnitude
@@ -580,16 +538,17 @@ end
 
 local function getSourceFolder(p)
     if not p then return nil end
-    local folder = blocksFolder or workspace:FindFirstChild("Blocks")
-    return folder and folder:FindFirstChild(p.Name) or nil
+    return blocksFolder:FindFirstChild(p.Name)
 end
 
-local function findPlacedBlock(folder, expected, tolerance)
-    if not folder then return nil, math.huge end
+local function findPlacedBlock(folder, expected, tolerance, ignored)
+    if not folder or not expected or typeof(expected.Pos) ~= "CFrame" then
+        return nil, math.huge
+    end
 
     local best, bestDist = nil, math.huge
     for _, b in ipairs(folder:GetChildren()) do
-        if b:IsA("Model") and b.Name == expected.Name then
+        if not (ignored and ignored[b]) and b:IsA("Model") and b.Name == expected.Name then
             local pp = b:FindFirstChild("PPart")
             if pp and pp:IsA("BasePart") then
                 local d = (pp.Position - expected.Pos.Position).Magnitude
@@ -607,48 +566,64 @@ local function findPlacedBlock(folder, expected, tolerance)
     return nil, bestDist
 end
 
-local function placeAndVerify(expected, destinationFolder, knownInstances)
-    if not destinationFolder then return nil end
+local function snapshotMatchingBlocks(folder, expected)
+    local snapshot = {}
+    if not folder or not expected then return snapshot end
+    for _, b in ipairs(folder:GetChildren()) do
+        if b:IsA("Model") and b.Name == expected.Name then
+            local pp = b:FindFirstChild("PPart")
+            if pp and pp:IsA("BasePart") then
+                snapshot[b] = true
+            end
+        end
+    end
+    return snapshot
+end
 
-    local maxAttempts = 5
+local function placeAndVerify(expected, destinationFolder)
+    local maxAttempts = 4
+    local lastError = nil
+
     for attempt = 1, maxAttempts do
+        if copyJobResetRequested then
+            return nil
+        end
+
         if attempt > 1 then
-            task.wait(math.min(0.2 * attempt, 0.8))
+            task.wait(0.2 * attempt)
         end
 
-        local before = {}
-        for _, child in ipairs(destinationFolder:GetChildren()) do
-            before[child] = true
+        -- จำบล็อกเดิมก่อนยิง Remote เพื่อไม่ให้การค้นหาหลังสร้าง
+        -- ไปหยิบบล็อกเก่าที่ชื่อเดียวกันมาแทนบล็อกใหม่
+        local before = snapshotMatchingBlocks(destinationFolder, expected)
+        local sent = placeBlock(expected.Name, expected.Pos, expected.Relative, true)
+        if not sent then
+            lastError = "BuildingTool RF failed"
+            continue
         end
 
-        -- วางทุกก้อนแบบไม่ Anchored ก่อน
-        placeBlock(expected.Name, expected.Pos, expected.Relative, false)
-
-        local deadline = os.clock() + 1.5 + (attempt * 0.25)
+        local deadline = os.clock() + (1.2 + attempt * 0.35)
         repeat
-            local best, bestDist = nil, math.huge
-            for _, b in ipairs(destinationFolder:GetChildren()) do
-                if b:IsA("Model") and b.Name == expected.Name and not before[b] and not (knownInstances and knownInstances[b]) then
-                    local pp = b:FindFirstChild("PPart")
-                    if pp and pp:IsA("BasePart") then
-                        local d = (pp.Position - expected.Pos.Position).Magnitude
-                        if d < bestDist then
-                            best, bestDist = b, d
-                        end
-                    end
-                end
+            if copyJobResetRequested then
+                return nil
             end
 
-            if best and bestDist <= 10 then
-                if knownInstances then knownInstances[best] = true end
-                return best
+            local b, dist = findPlacedBlock(destinationFolder, expected, 7, before)
+            if b then
+                return b
             end
             task.wait(0.08)
         until os.clock() >= deadline
+
+        lastError = "new block was not replicated in time"
     end
 
+    if lastError then
+        warn("[BABFT] Place/verify failed: " .. lastError .. " | " .. tostring(expected.Name))
+    end
     return nil
 end
+
 
 -- Helper key generator using Name + Position + Size for precise deduplication
 local function makeBlockKey(name, posCFrame, sizeVector)
@@ -674,6 +649,28 @@ local copyStatus = {
 }
 
 local statusGui, statusFrame, statusTitle, statusText, progressFill
+
+local function setCopyStatusUIVisible(visible)
+    copyStatusUiEnabled = visible == true
+    if statusGui then
+        statusGui.Enabled = copyStatusUiEnabled
+    end
+end
+
+local function resetCopyProjectStatus()
+    table.clear(knownBlocks)
+    copyStatus.total = 0
+    copyStatus.placed = 0
+    copyStatus.missing = 0
+    copyStatus.percent = 0
+    copyStatus.running = false
+    if statusGui and statusFrame and statusText and progressFill then
+        statusTitle.Text = "คัดลอกสิ่งก่อสร้าง"
+        statusText.Text = "ไม่มีโปรเจค\nหยุดอยู่ / พร้อมเริ่มใหม่"
+        progressFill.Size = UDim2.new(0, 0, 1, 0)
+        statusGui.Enabled = copyStatusUiEnabled
+    end
+end
 
 local function createCopyStatusUI()
     if statusFrame and statusFrame.Parent then return end
@@ -737,6 +734,7 @@ local function createCopyStatusUI()
     progressFill.Size = UDim2.new(0, 0, 1, 0)
     progressFill.BackgroundColor3 = COLORS.Mint
     progressFill.Parent = bar
+    statusGui.Enabled = copyStatusUiEnabled
 
     local fillCorner = Instance.new("UICorner")
     fillCorner.CornerRadius = UDim.new(0, 7)
@@ -744,6 +742,18 @@ local function createCopyStatusUI()
 end
 
 local function updateCopyStatus(total, placed, missing, running)
+    if not copyStatusUiEnabled then
+        copyStatus.total = total or 0
+        copyStatus.placed = placed or 0
+        copyStatus.missing = missing or 0
+        copyStatus.running = running == true
+        if copyStatus.total > 0 then
+            copyStatus.percent = math.floor((copyStatus.placed / copyStatus.total) * 100 + 0.5)
+        else
+            copyStatus.percent = 0
+        end
+        return
+    end
     createCopyStatusUI()
 
     copyStatus.total = total or 0
@@ -880,7 +890,6 @@ local function runCopyPreview(targetPlayer)
 end
 
 local function runCopyBuild(targetPlayer)
-    -- ปิด/ล้าง Preview ก่อนสร้างจริง เพื่อไม่ให้ภาพโปร่งใสซ้อนกับบล็อกจริง
     if copyPreviewEnabled then
         copyPreviewEnabled = false
         clearCopyPreview()
@@ -911,6 +920,7 @@ local function runCopyBuild(targetPlayer)
     end
 
     copyBusy = true
+    copyJobResetRequested = false
 
     local ok, err = pcall(function()
         local build = copyBuild(sourceFolder)
@@ -927,140 +937,116 @@ local function runCopyBuild(targetPlayer)
         end
 
         table.clear(knownBlocks)
-
         local total = #build
         local placed = 0
         local failed = {}
-        local placedRecords = {}
-        local knownInstances = {}
-        local earlyAnchored = {}
+        local createdRecords = {}
 
         updateCopyStatus(total, 0, total, true)
-        notifyCustom("คัดลอกสิ่งก่อสร้าง", "🔍 เริ่มวางแบบเสถียร " .. total .. " บล็อก...", 4, "🏗️")
+        setOperation("🧱 กำลังสร้างบล็อกทีละก้อน")
+        notifyCustom("คัดลอกสิ่งก่อสร้าง", "🏗️ เริ่มสร้าง " .. total .. " บล็อก...", 4, "🏗️")
 
-        -- Phase 1: วางทีละก้อนและจำ instance ที่วางสำเร็จทันที
         for i, expected in ipairs(build) do
-            local b = placeAndVerify(expected, destinationFolder, knownInstances)
+            if copyJobResetRequested then
+                notifyCustom("คัดลอกสิ่งก่อสร้าง", "⏹️ หยุดงานตามคำสั่ง", 3, "⏹️")
+                return
+            end
+
+            local b = placeAndVerify(expected, destinationFolder)
             if b then
                 placed += 1
-                placedRecords[i] = {instance = b, data = expected}
-
+                table.insert(createdRecords, {instance = b, data = expected})
                 local key = makeBlockKey(expected.Name, expected.Pos, expected.Size)
                 if key then knownBlocks[key] = true end
-
-                -- ถ้าต่อกับบล็อกอื่นแล้ว ใช้ Anchored ได้ทันที
-                if expected.Anchored and isConnectedToOtherBlock(b, destinationFolder) then
-                    if setAnchored(b) then
-                        earlyAnchored[b] = true
-                    end
-                    task.wait(0.04)
-                end
             else
                 table.insert(failed, i)
             end
 
             updateCopyStatus(total, placed, total - placed, true)
-
-            -- แจ้งความคืบหน้าแบบเดียวกับระบบต้นแบบ: ทุก 10 บล็อก
             if i % 10 == 0 or i == total then
-                notifyCustom(
-                    "คัดลอกสิ่งก่อสร้าง",
-                    ("📦 ความคืบหน้า %d/%d | ขาด %d บล็อก"):format(placed, total, total - placed),
-                    2,
-                    "📦"
-                )
+                notifyCustom("คัดลอกสิ่งก่อสร้าง", ("📦 ความคืบหน้า %d/%d | ขาด %d บล็อก"):format(placed, total, total - placed), 2, "📦")
             end
-
             task.wait(0.05)
         end
 
-        -- Phase 2: retry เฉพาะก้อนที่ยังวางไม่สำเร็จ
-        if #failed > 0 then
+        if #failed > 0 and not copyJobResetRequested then
             local retry = failed
             failed = {}
             task.wait(1)
-
             for _, index in ipairs(retry) do
-                local expected = build[index]
-                local b = placeAndVerify(expected, destinationFolder, knownInstances)
+                if copyJobResetRequested then
+                    notifyCustom("คัดลอกสิ่งก่อสร้าง", "⏹️ หยุดงานตามคำสั่ง", 3, "⏹️")
+                    return
+                end
+                setOperation(("🔄 กำลังลองใหม่: %s"):format(build[index].Name))
+                local b = placeAndVerify(build[index], destinationFolder)
                 if b then
                     placed += 1
-                    placedRecords[index] = {instance = b, data = expected}
-
-                    local key = makeBlockKey(expected.Name, expected.Pos, expected.Size)
-                    if key then knownBlocks[key] = true end
-
-                    if expected.Anchored and isConnectedToOtherBlock(b, destinationFolder) then
-                        if setAnchored(b) then
-                            earlyAnchored[b] = true
-                        end
-                        task.wait(0.04)
-                    end
+                    table.insert(createdRecords, {instance = b, data = build[index]})
                 else
                     table.insert(failed, index)
                 end
                 updateCopyStatus(total, placed, total - placed, true)
-                notifyCustom(
-                    "คัดลอกสิ่งก่อสร้าง",
-                    ("🔄 ลองใหม่ %d/%d | ขาด %d บล็อก"):format(placed, total, total - placed),
-                    2,
-                    "🔄"
-                )
-                task.wait(0.08)
+                task.wait(0.12)
             end
         end
 
-        -- Phase 3: ปรับแต่งจาก instance ที่เพิ่งวางโดยตรง ไม่ค้นหาจากชื่อซ้ำอีก
+        if copyJobResetRequested then
+            return
+        end
+
+        task.wait(0.8)
+        setOperation("📏 กำลังปรับขนาด/สี/ความโปร่งใส")
         local edited = 0
-        for i = 1, #build do
-            local record = placedRecords[i]
-            if record and record.instance and record.instance.Parent then
-                local b, v = record.instance, record.data
-                rescaleBlock(b, v.Pos, v.Size)
+        for _, record in ipairs(createdRecords) do
+            if copyJobResetRequested then return end
+            local b, data = record.instance, record.data
+            if b and b.Parent then
+                rescaleBlock(b, data.Pos, data.Size)
                 task.wait(0.04)
-                paintBlock(b, v.Color)
+                paintBlock(b, data.Color)
                 task.wait(0.04)
-                if v.Transparency > 0 then
-                    setTransparency(v.Transparency, b)
+                if data.Transparency > 0 then
+                    setTransparency(data.Transparency, b)
                     task.wait(0.04)
                 end
                 edited += 1
             end
-            if i % 10 == 0 then task.wait(0.12) end
         end
 
-        -- Phase 4: Anchored รอบสุดท้ายสำหรับก้อนที่ยังลอยอยู่
-        task.wait(0.25)
-        for i = 1, #build do
-            local record = placedRecords[i]
-            if record and record.instance and record.instance.Parent and record.data.Anchored and not earlyAnchored[record.instance] then
+        -- คืนค่า Anchored ตามต้นฉบับหลังสร้าง/ปรับแต่งครบ
+        task.wait(0.5)
+        setOperation("⚓ กำลังคืนค่า Anchored")
+        for _, record in ipairs(createdRecords) do
+            if copyJobResetRequested then return end
+            local pp = record.instance and record.instance:FindFirstChild("PPart")
+            if pp and pp:IsA("BasePart") and pp.Anchored ~= (record.data.Anchored == true) then
                 setAnchored(record.instance)
-                task.wait(0.05)
+                task.wait(0.04)
             end
         end
 
-        local finalMissing = #failed
-        updateCopyStatus(total, placed, finalMissing, false)
-
-        local msg = finalMissing == 0 
-            and ("✅ เสร็จสมบูรณ์ %d/%d บล็อก (ปรับแต่ง %d)"):format(placed, total, edited)
-            or ("⚠️ วางสำเร็จ %d/%d | ขาด %d บล็อก"):format(placed, total, finalMissing)
-
-        notifyCustom("คัดลอกสิ่งก่อสร้าง", msg, 5, "✅")
+        updateCopyStatus(total, placed, #failed, false)
+        if #failed == 0 then
+            setOperation("✅ ทำเสร็จครบทุกบล็อก")
+            notifyCustom("คัดลอกสิ่งก่อสร้าง", ("✅ เสร็จครบ %d/%d | ปรับแต่ง %d/%d"):format(placed, total, edited, total), 6, "✅")
+        else
+            setOperation(("⚠️ เสร็จแล้ว แต่ยังขาด %d บล็อก"):format(#failed))
+            notifyCustom("คัดลอกสิ่งก่อสร้าง", ("⚠️ วางได้ %d/%d | ขาด %d บล็อก"):format(placed, total, #failed), 6, "⚠️")
+            warn("[BABFT] Failed block indexes: " .. table.concat(failed, ", "))
+        end
     end)
 
     copyBusy = false
-
+    copyJobResetRequested = false
     if not ok then
         warn("[BABFT Copy Error]", err)
-        notifyCustom("คัดลอกสิ่งก่อสร้าง", "❌ เกิดข้อผิดพลาดขณะคัดลอก", 4, "❌")
+        updateCopyStatus(0, 0, 0, false)
+        setOperation("❌ Copy เกิดข้อผิดพลาด")
+        notifyCustom("คัดลอกสิ่งก่อสร้าง", "❌ Copy เกิดข้อผิดพลาด: " .. tostring(err), 6, "❌")
     end
 end
 
-
--- ============================================================
--- 4. UPDATE SYSTEM (Name + Position + Size Deduplication)
--- ============================================================
 local function runUpdateBuild()
     -- ปิด/ล้าง Preview ก่อน Update จริง เพื่อไม่ให้ภาพโปร่งใสซ้อนกับบล็อกจริง
     if copyPreviewEnabled then
@@ -1098,6 +1084,7 @@ local function runUpdateBuild()
     end
 
     updateBusy = true
+    copyJobResetRequested = false
 
     local success, err = pcall(function()
         notifyCustom("อัปเดตสิ่งก่อสร้าง", "🔍 กำลังตรวจหาบล็อกใหม่...", 2, "🔍")
@@ -1133,20 +1120,14 @@ local function runUpdateBuild()
         local placedCount = 0
         local newlyPlacedInstances = {}
 
-        local earlyAnchoredUpdate = {}
-
         local updateTotal = #newBlocksToPlace
         for updateIndex, item in ipairs(newBlocksToPlace) do
+            if copyJobResetRequested then
+                notifyCustom("อัปเดตสิ่งก่อสร้าง", "⏹️ รีเซ็ตงาน: ยกเลิก Update", 3, "⏹️")
+                return
+            end
             local b = placeAndVerify(item.data, destinationFolder)
             if b then
-                -- ถ้าบล็อกใหม่เชื่อมกับบล็อกอื่นแล้ว ให้ใช้แรงโน้มถ่วงได้ทันที
-                if item.data.Anchored and isConnectedToOtherBlock(b, destinationFolder) then
-                    if setAnchored(b) then
-                        earlyAnchoredUpdate[b] = true
-                    end
-                    task.wait(0.03)
-                end
-
                 -- เพิ่มเข้า knownBlocks เมื่อวางสำเร็จจริงเท่านั้น
                 knownBlocks[item.key] = true
                 placedCount += 1
@@ -1173,11 +1154,13 @@ local function runUpdateBuild()
             end
         end
 
-        -- ขั้นตอนสุดท้าย: ใช้ไขควงตั้ง Anchored/แรงโน้มถ่วง
-        -- ทำหลังจากบล็อกใหม่ทุกก้อนถูกวางและปรับแต่งเสร็จแล้ว
+        -- ขั้นตอนสุดท้าย: คืนค่า Anchored ให้ตรงกับต้นฉบับ
+        -- บล็อกถูกยึดไว้ชั่วคราวระหว่างสร้าง เพื่อป้องกันการตก/เคลื่อน
         task.wait(0.15)
         for _, item in ipairs(newlyPlacedInstances) do
-            if item.data.Anchored and not earlyAnchoredUpdate[item.instance] then
+            local pp = item.instance and item.instance:FindFirstChild("PPart")
+            local desiredAnchored = item.data.Anchored == true
+            if pp and pp:IsA("BasePart") and pp.Anchored ~= desiredAnchored then
                 setAnchored(item.instance)
                 task.wait(0.03)
             end
@@ -1915,6 +1898,18 @@ copyTab:CreateButton({
 })
 
 copyTab:CreateButton({
+    Name = "🛑 รีเซ็ตงานที่ทำ / หยุดการคัดลอก",
+    Callback = function()
+        if copyBusy or updateBusy then
+            copyJobResetRequested = true
+            notifyCustom("Copy", "🛑 สั่งหยุดงานแล้ว — จะหยุดทันทีหลังจบขั้นตอนปัจจุบัน", 3, "🛑")
+        else
+            notifyCustom("Copy", "ℹ️ ไม่มีงาน Copy/Update กำลังทำอยู่", 2, "ℹ️")
+        end
+    end,
+})
+
+copyTab:CreateButton({
     Name = "➖ อัปเดตสิ่งก่อสร้าง",
     Callback = function()
         runUpdateBuild()
@@ -2178,9 +2173,20 @@ settingsTab:CreateButton({
     end,
 })
 
+settingsTab:CreateToggle({
+    Name = "📊 เปิด/ปิดหน้าต่างสถานะ Copy",
+    CurrentValue = true,
+    Callback = function(value)
+        setCopyStatusUIVisible(value)
+        notifyCustom("สถานะ Copy", value and "👁️ แสดงหน้าต่างสถานะแล้ว" or "🙈 ซ่อนหน้าต่างสถานะแล้ว", 2, value and "👁️" or "🙈")
+    end,
+})
+
 settingsTab:CreateButton({
-    Name = "🔄 รีเซ็ตการทำงาน",
+    Name = "🔄 รีเซ็ตงาน / ไม่มีโปรเจค",
     Callback = function()
+        resetRequested = true
+        copyJobResetRequested = true
         stopFarm()
         stopTravel()
         stopAFK()
@@ -2192,7 +2198,13 @@ settingsTab:CreateButton({
         if viewEnabled then
             setViewEnabled(false)
         end
-        notifyCustom("Settings", "↩️ รีเซ็ตสถานะระบบแล้ว", 3, "🔄")
+        copyPreviewEnabled = false
+        clearCopyPreview()
+        if copyPreviewToggle then
+            pcall(function() copyPreviewToggle:Set(false) end)
+        end
+        resetCopyProjectStatus()
+        notifyCustom("Settings", "⏹️ หยุดทุกงานแล้ว • ไม่มีโปรเจค", 3, "🔄")
     end,
 })
 
