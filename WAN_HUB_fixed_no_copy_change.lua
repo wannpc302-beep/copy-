@@ -358,17 +358,46 @@ local function isConnectedToOtherBlock(block, destinationFolder)
 end
 
 local function rescaleBlock(block, newPos, newSize)
-    if not block then return end
+    if not block or typeof(newSize) ~= "Vector3" then return false end
 
     local tool = equipTool("ScalingTool")
-    if not tool or not tool:FindFirstChild("RF") then return end
-
-    local ok, err = pcall(function()
-        tool.RF:InvokeServer(block, newSize, newPos)
-    end)
-    if not ok then
-        warn("[BABFT] Rescale failed: " .. tostring(err))
+    if not tool or not tool:FindFirstChild("RF") then
+        warn("[BABFT] ScalingTool/RF not found")
+        return false
     end
+
+    -- ใช้ CFrame ปัจจุบันของบล็อกที่สร้างจริงเป็นตำแหน่ง Scale
+    -- และตรวจ Size หลัง InvokeServer เพื่อไม่ให้แค่ส่งคำสั่งแล้วถือว่าสำเร็จ
+    local targetCFrame = newPos
+    local ppart = block:FindFirstChild("PPart")
+    if ppart and ppart:IsA("BasePart") then
+        targetCFrame = ppart.CFrame
+    end
+
+    for attempt = 1, 3 do
+        local ok, result = pcall(function()
+            return tool.RF:InvokeServer(block, newSize, targetCFrame)
+        end)
+
+        if not ok then
+            warn("[BABFT] Rescale failed (attempt " .. attempt .. "): " .. tostring(result))
+        end
+
+        task.wait(0.12 * attempt)
+
+        ppart = block:FindFirstChild("PPart")
+        if ppart and ppart:IsA("BasePart") then
+            local delta = (ppart.Size - newSize).Magnitude
+            if delta <= 0.05 then
+                return true
+            end
+        end
+    end
+
+    warn("[BABFT] Scaling verification failed for " .. tostring(block.Name) ..
+        " | target=" .. tostring(newSize) ..
+        " | actual=" .. tostring(ppart and ppart.Size))
+    return false
 end
 
 local function placeBlock(name, pos, relativeTo, anchored)
@@ -1829,20 +1858,49 @@ do
         if type(loadstring) ~= "function" then
             error("loadstring is not available in this executor")
         end
-        local source = game:HttpGet("https://sirius.menu/rayfield")
-        if type(source) ~= "string" or source == "" then
-            error("Rayfield source could not be downloaded")
+
+        -- ใช้ตัวโหลดทางการก่อน และมี GitHub ทางการเป็น fallback
+        local urls = {
+            "https://sirius.menu/rayfield",
+            "https://raw.githubusercontent.com/sirius-menu/rayfield/refs/heads/main/source.lua",
+        }
+
+        local lastErr = "unknown error"
+        for _, url in ipairs(urls) do
+            local loaded, value = pcall(function()
+                local source = game:HttpGet(url)
+                if type(source) ~= "string" or source == "" then
+                    error("empty Rayfield source")
+                end
+
+                local chunk, compileErr = loadstring(source)
+                if not chunk then
+                    error(compileErr or "Rayfield source failed to compile")
+                end
+
+                local lib = chunk()
+                if type(lib) ~= "table" or type(lib.CreateWindow) ~= "function" then
+                    error("Rayfield library loaded but CreateWindow is unavailable")
+                end
+                return lib
+            end)
+
+            if loaded then
+                return value
+            end
+
+            lastErr = tostring(value)
+            warn("[WAN HUB] Rayfield load failed from " .. url .. ": " .. lastErr)
         end
-        local chunk, compileErr = loadstring(source)
-        if not chunk then
-            error(compileErr or "Rayfield source failed to compile")
-        end
-        return chunk()
+
+        error(lastErr)
     end)
 
     if not ok or type(result) ~= "table" then
         warn("[WAN HUB] Rayfield failed to load: " .. tostring(result))
-        notifyCustom("WAN HUB", "❌ โหลด Rayfield ไม่สำเร็จ กรุณาใช้ executor ที่รองรับ loadstring + HttpGet", 8, "❌")
+        updateCopyStatus(0, 0, 0, false)
+        if statusTitle then statusTitle.Text = "WAN HUB โหลดไม่ครบ" end
+        if statusText then statusText.Text = "Rayfield โหลดไม่สำเร็จ\nตรวจสอบ executor / HttpGet / loadstring" end
         error("[WAN HUB] Rayfield failed to load: " .. tostring(result))
     end
 
@@ -1856,6 +1914,7 @@ local Window = Rayfield:CreateWindow({
     LoadingSubtitle = "Copy & Management System",
     Theme = "Ocean",
     ToggleUIKeybind = "G",
+    ShowText = "WAN HUB",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings = false,
     ConfigurationSaving = {
